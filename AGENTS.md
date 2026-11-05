@@ -1,5 +1,43 @@
 # Repository Guide for Agents
 
+## 自部署 Server 发布流程（remote.papafeiji.cn，2026-11-05）
+
+本仓库 main 是 `SideProject-Tool/ds-harness-remote` 的自托管分支：上游代码 + 一组只作用于
+`apps/server` 的补丁（SPA `/app/*` 回退、设备改名/移除、角色 Tab、30 天滑动会话、`/register`
+合并鉴权、移除后可恢复、Dockerfile 换 alpine + npmmirror）。这些补丁使客户端插件与 Web 控制台
+在自部署 Server 上的体验与官方云站一致，**上游 `ghcr.io/.../server` 镜像没有这些能力**，不要用
+上游镜像替换生产容器（`/app/remote` 会直接 404 `METHOD_NOT_FOUND`，设备改名/角色 Tab 也不存在）。
+
+生产部署：`47.98.121.243`（ssh 别名 `papamemo`，2C2G），`/opt/dsh-remote-server/{compose.yaml,.env}`，
+容器 `dsh-remote-server-server-1` 只监听 `127.0.0.1:8080`，宿主 nginx 反代 443 并持有 Let's
+Encrypt 证书；数据在 docker 卷 `dsh-remote-server_server-data`（`state.json`），**任何操作都不要
+`docker compose down -v`**。
+
+发布只用仓库根的 `deploy.sh`（在控制机执行，**禁止在 243 上 `docker compose build`**：2G 内存上
+pnpm+vite 构建会把整机拖死，历史上就是这样把机器弄挂并重装的）：
+
+```bash
+./deploy.sh                      # tag 自动 <apps/server 版本>-g<短 SHA>[-dirty]
+./deploy.sh --tag 0.6.3-custom2  # 指定 tag
+./deploy.sh --skip-build         # 复用本机镜像，只传输/切换/校验
+./deploy.sh --no-verify          # 跳过公网校验
+./deploy.sh --dry-run            # 只打印计划
+```
+
+脚本流程：`docker build -f apps/server/Dockerfile` → 镜像自检（断言 `dist/server.js` 含
+`devices/rename` 与 `/app/` 回退）→ `docker save | gzip | ssh docker load` → 备份远端
+`compose.yaml` 并改 image tag → `docker compose up -d --force-recreate server` → 等 healthy →
+公网校验 `/`、`/app/login`、`/app/remote`、`/healthz` 与前端 bundle 是否含 `devices/rename`；
+失败时打印回滚命令。可调环境变量：`DEPLOY_SSH`、`DEPLOY_REMOTE_DIR`、`PUBLIC_URL`。
+
+已知网络约束：控制机 docker daemon 直连 `ghcr.io` 会 `EOF`，拉上游镜像要用 `skopeo`；243 到
+`pkg-containers.githubusercontent.com` 只有约 30 KB/s，所以镜像必须由控制机构建后推送，不要在
+目标机拉取或构建。改 `.env` 后必须 `up -d --force-recreate`，`restart` 不会重载环境变量；
+`DSH_SERVER_PUBLIC_URL` 必须等于浏览器 origin，否则静态资源 403 `AUTH_INVALID` 白屏。
+
+运维细节（证书、nginx、限流、回滚、日志）见控制机
+`/root/DeployOps/ops-docs/dsh-remote-server.md` 与远端 `/opt/dsh-remote-server/DEPLOY.md`。
+
 ## Harness 0.2.2 compatibility (2026-11-05)
 
 开发基线升级到 `dsh-v0.2.2-rc.1`，随附 Cordis `4.1.0`、Loader `1.1.0`、Include `1.1.0`
