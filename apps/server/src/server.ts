@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import { isIP } from 'node:net'
 import { z } from 'zod'
-import { deviceRegistrationRequestSchema, deviceRefreshRequestSchema } from '@dsh-remote/protocol'
+import { deviceRegistrationRequestSchema, deviceRefreshRequestSchema, MAX_DEVICE_NAME_LENGTH } from '@dsh-remote/protocol'
 import { ApiError, Store, equal, hash, secret } from './store.js'
 import { Gateway } from './gateway.js'
 import { Logger, type LogLevel } from './logger.js'
@@ -70,6 +70,9 @@ export {
 export type { GatewayTimingOptions, NormalizedGatewayOptions } from './config.js'
 
 const loginSchema = z.object({ email: z.string().min(1).max(254), password: z.string().min(1).max(1024) }).strict()
+const renameSchema = z.object({ deviceId: z.string().min(1).max(128), name: z.string().max(MAX_DEVICE_NAME_LENGTH) }).strict()
+// Self-host patch: 30-day sliding web sessions (persisted in the store) so the console stays signed in.
+const WEB_SESSION_MS = 30 * 86400_000
 const publicDir = fileURLToPath(new URL('../dist/public/', import.meta.url))
 function readAssets(): Map<string, Buffer> {
   if (!existsSync(publicDir)) return new Map()
@@ -156,7 +159,6 @@ export function createRemoteServer(config: Config) {
   const trustedProxyIps = normalizeTrustedProxyIps(config.trustedProxyIps)
   const store = new Store(config.dataFile, config.account.trim(), config.password)
   const assets = readAssets()
-  const sessions = new Map<string, number>()
   const limits = new Map<string, { count: number; until: number }>()
   function rate(key: string, max: number) {
     for (const [k, v] of limits) if (v.until < Date.now()) limits.delete(k)
@@ -171,7 +173,9 @@ export function createRemoteServer(config: Config) {
   }
   function accountAuth(req: IncomingMessage) {
     const key = hash(token(req))
-    if ((sessions.get(key) ?? 0) <= Date.now()) { sessions.delete(key); throw new ApiError('ACCOUNT_AUTH_REQUIRED', 401) }
+    const expires = store.getWebSession(key)
+    if (!expires || expires <= Date.now()) { if (expires) store.deleteWebSession(key); throw new ApiError('ACCOUNT_AUTH_REQUIRED', 401) }
+    if (expires - Date.now() < WEB_SESSION_MS / 2) store.saveWebSession(key, Date.now() + WEB_SESSION_MS)
   }
   function deviceAuth(req: IncomingMessage) {
     if (!req.headers.authorization?.startsWith('Bearer ')) throw new ApiError('AUTH_REQUIRED', 401)
@@ -214,7 +218,8 @@ export function createRemoteServer(config: Config) {
     if (req.headers.origin && req.headers.origin !== url.origin) throw new ApiError('AUTH_INVALID', 403)
     if (req.headers['sec-fetch-site'] === 'cross-site') throw new ApiError('AUTH_INVALID', 403)
     const staticAsset = path.startsWith('/assets/') || ['/icon.png', '/brand-whale.webp', '/landing-atmosphere.webp'].includes(path)
-    if (method === 'GET' && (['/', '/app', '/app/login'].includes(path) || staticAsset)) {
+    // SPA fallback: any /app/* route (e.g. /app/remote) serves index.html so browser refresh works.
+    if (method === 'GET' && (path === '/' || path === '/app' || path.startsWith('/app/') || staticAsset)) {
       const name = staticAsset ? path.slice(1) : 'index.html'
       const asset = assets.get(name)
       if (!asset) throw new ApiError('METHOD_NOT_FOUND', 404)
@@ -229,23 +234,41 @@ export function createRemoteServer(config: Config) {
       rate(`login:${client}`, 20)
       const credentials = loginSchema.parse(await body(req))
       if (!equal(credentials.email.trim(), store.account) || !equal(credentials.password, config.password)) throw new ApiError('AUTH_INVALID', 401)
-      for (const [key, expires] of sessions) if (expires <= Date.now()) sessions.delete(key)
-      if (sessions.size >= 256) throw new ApiError('RATE_LIMITED', 429)
-      const value = secret(), expiresAt = Date.now() + 8 * 3600_000
-      sessions.set(hash(value), expiresAt)
-      res.setHeader('Set-Cookie', cookie(value, 8 * 3600))
+      const value = secret(), expiresAt = Date.now() + WEB_SESSION_MS
+      store.saveWebSession(hash(value), expiresAt)
+      res.setHeader('Set-Cookie', cookie(value, 365 * 86400))
       json(res, 200, { ...profile(), token: value, expiresAt }); return
     }
     if (method === 'GET' && path === '/api/v1/auth/me') { accountAuth(req); json(res, 200, profile()); return }
     if (method === 'POST' && path === '/api/v1/auth/logout') {
-      sessions.delete(hash(token(req))); res.setHeader('Set-Cookie', cookie('', 0)); json(res, 200, { status: 'ok' }); return
+      store.deleteWebSession(hash(token(req))); res.setHeader('Set-Cookie', cookie('', 0)); json(res, 200, { status: 'ok' }); return
     }
     if (method === 'GET' && path === '/api/v1/account/devices') {
       accountAuth(req); json(res, 200, { items: store.list().map(descriptor), serverUrl: url.origin, transport: 'relay' }); return
     }
+    if (method === 'POST' && path === '/api/v1/devices/rename') {
+      accountAuth(req)
+      const { deviceId, name } = renameSchema.parse(await body(req))
+      const trimmed = name.trim()
+      if (!trimmed) throw new ApiError('INVALID_MESSAGE', 400)
+      store.rename(deviceId, trimmed)
+      json(res, 200, { status: 'ok', name: trimmed }); return
+    }
     if (method === 'POST' && (path === '/api/v1/devices/register' || path === '/api/v1/devices/register-owned-role')) {
-      const source = path.endsWith('register-owned-role') ? deviceAuth(req) : undefined
-      if (!source) accountAuth(req)
+      // /register accepts EITHER an account session (any role) or a device access token
+      // (opposite role only, same rule as /register-owned-role). The plugin's automatic
+      // "authorize the local Host as an owned device" flow reuses /register with the
+      // Client device token, so rejecting it here would leave the Host unauthorized.
+      const owned = path.endsWith('register-owned-role')
+      let source: ReturnType<Store['authenticate']> | undefined
+      const bearer = req.headers.authorization?.startsWith('Bearer ') ? req.headers.authorization.slice(7) : ''
+      if (owned) {
+        source = deviceAuth(req)
+      } else if (bearer) {
+        try { source = store.authenticate(bearer) } catch { accountAuth(req) }
+      } else {
+        accountAuth(req)
+      }
       const { device } = deviceRegistrationRequestSchema.parse(await body(req))
       if (source && (source.descriptor.deviceId === device.deviceId || source.descriptor.role === device.role)) throw new ApiError('INVALID_MESSAGE', 409)
       json(res, 200, store.register(device)); return
@@ -256,6 +279,13 @@ export function createRemoteServer(config: Config) {
     }
     if (method === 'DELETE' && path === '/api/v1/devices/self') {
       store.revoke(deviceAuth(req).descriptor.deviceId); json(res, 200, { status: 'revoked' }); return
+    }
+    const removeMatch = /^\/api\/v1\/devices\/([^/]+)$/.exec(path)
+    if (method === 'DELETE' && removeMatch) {
+      // Account-console removal: revokes the device and drops its live connections.
+      accountAuth(req)
+      store.revoke(removeMatch[1]!)
+      json(res, 200, { status: 'revoked' }); return
     }
     if (method === 'GET' && path === '/api/v1/me') { json(res, 200, descriptor(deviceAuth(req))); return }
     if (method === 'GET' && path === '/api/v1/devices') {

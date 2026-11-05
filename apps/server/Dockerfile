@@ -1,4 +1,8 @@
-FROM node:22-bookworm-slim AS build
+FROM node:22-alpine AS build
+# Local build note: use the npmmirror registry (Docker Hub / npmjs are unreachable here).
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+ENV npm_config_registry=$NPM_REGISTRY \
+    COREPACK_NPM_REGISTRY=$NPM_REGISTRY
 WORKDIR /workspace
 RUN corepack enable && corepack prepare pnpm@9.15.4 --activate
 
@@ -26,7 +30,7 @@ RUN rm -rf /out/node_modules/@dsh-remote/protocol \
     && cp -R packages/protocol/dist /out/node_modules/@dsh-remote/protocol/dist \
     && chmod -R a+rX /out
 
-FROM node:22-bookworm-slim AS runtime
+FROM node:22-alpine AS runtime
 ENV NODE_ENV=production \
     DSH_SERVER_HOST=0.0.0.0 \
     DSH_SERVER_PORT=8080 \

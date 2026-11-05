@@ -7,13 +7,14 @@ export interface DeviceList { items: Device[]; serverUrl: string; transport: str
 export class RequestError extends Error {
   constructor(message: string, readonly status: number) { super(message) }
 }
-export async function api<T>(path: string, body?: unknown): Promise<T> {
+export async function api<T>(path: string, body?: unknown, method?: 'GET' | 'POST' | 'DELETE'): Promise<T> {
+  const verb = method ?? (body === undefined ? 'GET' : 'POST')
   let response: Response
   try {
     response = await fetch(`/api/v1${path}`, {
-      method: body === undefined ? 'GET' : 'POST',
+      method: verb,
       credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      ...(body === undefined || verb === 'GET' ? {} : { body: JSON.stringify(body) }),
       signal: AbortSignal.timeout(10000),
     })
   } catch { throw new RequestError('连接失败，请重试。', 0) }
